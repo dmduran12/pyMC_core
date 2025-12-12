@@ -168,12 +168,11 @@ class PacketBuilder:
         if final_flags & ADVERT_FLAG_HAS_FEATURE2:
             buf += struct.pack("<H", feature2)
 
-        # Add name if present
+        # Add name if present (no null terminator, matching MeshCore)
         if final_flags & ADVERT_FLAG_HAS_NAME:
-            name_bytes = name.encode("utf-8")[:31] + b"\x00"
+            name_bytes = name.encode("utf-8")[:MAX_ADVERT_DATA_SIZE - len(buf)]
             buf += name_bytes
-        else:
-            buf += bytes(32)
+        # MeshCore adds nothing when no name
 
         return bytes(buf)
 
