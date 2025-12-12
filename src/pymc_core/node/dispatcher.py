@@ -531,6 +531,13 @@ class Dispatcher:
 
     async def run_forever(self) -> None:
         """Run the dispatcher maintenance loop indefinitely (call this in an asyncio task)."""
+        # CRITICAL: Ensure RX task is started now that event loop is running
+        # This fixes race condition where radio.begin() and set_rx_callback()
+        # were called before asyncio.run() started the event loop
+        if hasattr(self.radio, "check_radio_health"):
+            self.radio.check_radio_health()
+            self._log("[RX] Ensured RX background task is running")
+
         health_check_counter = 0
         while True:
             # Clean out old ACK CRCs (older than 5 seconds)
