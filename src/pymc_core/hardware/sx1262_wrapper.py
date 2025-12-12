@@ -143,6 +143,14 @@ class SX1262Radio(LoRaRadio):
         self._custom_cad_peak = None
         self._custom_cad_min = None
 
+        # Watchdog and health monitoring
+        self._last_rx_time = time.time()  # Track last successful RX
+        self._last_health_check = time.time()
+        self._consecutive_errors = 0
+        self._max_consecutive_errors = 3  # Reset after this many errors
+        self._rx_timeout_threshold = 120  # Seconds without RX before watchdog triggers
+        self._is_recovering = False  # Prevent recursive recovery
+
         # Noise floor sampling
         self._noise_floor = -99.0
         self._num_floor_samples = 0
@@ -392,6 +400,8 @@ class SX1262Radio(LoRaRadio):
                                     if self.rx_callback:
                                         try:
                                             self.rx_callback(packet_data)
+                                            # Reset watchdog on successful RX
+                                            self.reset_watchdog()
                                         except Exception as cb_exc:
                                             logger.error(f"RX callback error: {cb_exc}")
                                     else:
@@ -458,10 +468,12 @@ class SX1262Radio(LoRaRadio):
         logger.warning("[RX] RX IRQ background task exiting")
 
     def check_radio_health(self) -> bool:
-        """Simple health check - restart RX task if it's dead."""
+        """Comprehensive health check - detect stuck radio and recover."""
         if not self._initialized:
             return False
 
+        current_time = time.time()
+        
         # Check if RX task is dead and restart it
         if (
             not hasattr(self, "_rx_irq_task")
@@ -471,12 +483,193 @@ class SX1262Radio(LoRaRadio):
             try:
                 loop = asyncio.get_running_loop()
                 self._rx_irq_task = loop.create_task(self._rx_irq_background_task())
-                logger.warning("[RX] Restarted dead RX task")
-                return False  # Was dead, now restarted
+                logger.warning("[Watchdog] Restarted dead RX task")
+                self._consecutive_errors += 1
             except Exception:
-                return False  # Failed to restart
+                self._consecutive_errors += 1
+                return False
 
-        return True  # Task is alive
+        # Check for RX timeout (no packets received for too long)
+        time_since_rx = current_time - self._last_rx_time
+        if time_since_rx > self._rx_timeout_threshold:
+            logger.warning(
+                f"[Watchdog] No RX activity for {time_since_rx:.0f}s "
+                f"(threshold: {self._rx_timeout_threshold}s)"
+            )
+            self._consecutive_errors += 1
+
+        # If too many consecutive errors, trigger recovery
+        if self._consecutive_errors >= self._max_consecutive_errors:
+            logger.error(
+                f"[Watchdog] {self._consecutive_errors} consecutive errors detected - "
+                "initiating radio recovery"
+            )
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(self._recover_radio())
+            except RuntimeError:
+                # No event loop, try sync recovery
+                self._sync_recover_radio()
+            return False
+
+        self._last_health_check = current_time
+        return True
+
+    async def _recover_radio(self) -> bool:
+        """Async radio recovery - full reset and reinitialize."""
+        if self._is_recovering:
+            logger.debug("[Recovery] Already recovering, skipping")
+            return False
+            
+        self._is_recovering = True
+        logger.warning("[Recovery] Starting async radio recovery...")
+        
+        try:
+            # Stop RX task first
+            if hasattr(self, "_rx_irq_task") and self._rx_irq_task:
+                self._rx_irq_task.cancel()
+                try:
+                    await self._rx_irq_task
+                except asyncio.CancelledError:
+                    pass
+            
+            # Hardware reset sequence
+            success = self._hardware_reset_sequence()
+            
+            if success:
+                # Reset counters on successful recovery
+                self._consecutive_errors = 0
+                self._last_rx_time = time.time()
+                logger.info("[Recovery] Radio recovery completed successfully")
+                
+                # Restart RX task
+                try:
+                    loop = asyncio.get_running_loop()
+                    self._rx_irq_task = loop.create_task(self._rx_irq_background_task())
+                except Exception as e:
+                    logger.warning(f"[Recovery] Failed to restart RX task: {e}")
+            else:
+                logger.error("[Recovery] Radio recovery failed")
+                
+            return success
+        finally:
+            self._is_recovering = False
+    
+    def _sync_recover_radio(self) -> bool:
+        """Synchronous radio recovery for when no event loop is available."""
+        if self._is_recovering:
+            return False
+            
+        self._is_recovering = True
+        logger.warning("[Recovery] Starting sync radio recovery...")
+        
+        try:
+            success = self._hardware_reset_sequence()
+            if success:
+                self._consecutive_errors = 0
+                self._last_rx_time = time.time()
+                logger.info("[Recovery] Sync radio recovery completed")
+            return success
+        finally:
+            self._is_recovering = False
+    
+    def _hardware_reset_sequence(self) -> bool:
+        """Perform hardware reset sequence to recover stuck radio."""
+        if not self.lora:
+            logger.error("[Recovery] No LoRa object available")
+            return False
+            
+        try:
+            logger.debug("[Recovery] Step 1: Clearing all interrupts")
+            try:
+                self.lora.clearIrqStatus(0xFFFF)
+            except Exception:
+                pass  # May fail if radio is hung
+            
+            logger.debug("[Recovery] Step 2: Hardware reset")
+            self.lora.reset()
+            time.sleep(0.1)  # Wait for reset to complete
+            
+            logger.debug("[Recovery] Step 3: Set standby mode")
+            self.lora.setStandby(self.lora.STANDBY_RC)
+            time.sleep(0.05)
+            
+            # Verify standby mode
+            busy_wait = 0
+            while self.lora.busyCheck() and busy_wait < 50:
+                time.sleep(0.01)
+                busy_wait += 1
+            
+            if self.lora.busyCheck():
+                logger.error("[Recovery] Radio stuck busy after reset")
+                return False
+            
+            logger.debug("[Recovery] Step 4: Reconfigure radio")
+            # Set packet type
+            self.lora.setPacketType(self.lora.LORA_MODEM)
+            
+            # Reconfigure frequency
+            rfFreq = int(self.frequency * 33554432 / 32000000)
+            self.lora.setRfFrequency(rfFreq)
+            
+            # Reconfigure modulation
+            symbol_duration_ms = (2**self.spreading_factor) / (self.bandwidth / 1000)
+            ldro = symbol_duration_ms > 16.0
+            self.lora.setLoRaModulation(
+                self.spreading_factor, self.bandwidth, self.coding_rate, ldro
+            )
+            
+            # Reconfigure packet params
+            self.lora.setPacketParamsLoRa(
+                self.preamble_length,
+                self.lora.HEADER_EXPLICIT,
+                64,
+                self.lora.CRC_ON,
+                self.lora.IQ_STANDARD,
+            )
+            
+            # Reconfigure TX power
+            self.lora.setTxPower(self.tx_power, self.lora.TX_POWER_SX1262)
+            
+            logger.debug("[Recovery] Step 5: Configure interrupts and start RX")
+            # Configure RX interrupts
+            rx_mask = self._get_rx_irq_mask()
+            self.lora.setDioIrqParams(rx_mask, rx_mask, self.lora.IRQ_NONE, self.lora.IRQ_NONE)
+            self.lora.clearIrqStatus(0xFFFF)
+            
+            # Set to RX continuous mode
+            self.lora.request(self.lora.RX_CONTINUOUS)
+            
+            # Reset TX/RX pins to RX mode
+            self._control_tx_rx_pins(tx_mode=False)
+            
+            logger.info("[Recovery] Hardware reset sequence completed successfully")
+            return True
+            
+        except Exception as e:
+            logger.error(f"[Recovery] Hardware reset failed: {e}")
+            return False
+    
+    def reset_watchdog(self) -> None:
+        """Reset watchdog counters - call this after successful RX."""
+        self._last_rx_time = time.time()
+        self._consecutive_errors = 0
+    
+    def get_health_stats(self) -> dict:
+        """Get radio health statistics for monitoring."""
+        current_time = time.time()
+        return {
+            "time_since_last_rx": current_time - self._last_rx_time,
+            "consecutive_errors": self._consecutive_errors,
+            "is_recovering": self._is_recovering,
+            "rx_timeout_threshold": self._rx_timeout_threshold,
+            "initialized": self._initialized,
+            "rx_task_alive": (
+                hasattr(self, "_rx_irq_task") 
+                and self._rx_irq_task is not None 
+                and not self._rx_irq_task.done()
+            ),
+        }
 
     def begin(self) -> bool:
         """Initialize the SX1262 radio module. Returns True if successful, False otherwise."""
@@ -937,6 +1130,15 @@ class SX1262Radio(LoRaRadio):
             logger.error("Radio configuration issue: TX operation timed out without starting")
 
         self.lora.clearIrqStatus(irqStat)
+        
+        # Increment watchdog error counter - TX timeout often indicates stuck radio
+        self._consecutive_errors += 1
+        logger.warning(f"[Watchdog] TX timeout - consecutive errors: {self._consecutive_errors}")
+        
+        # Trigger recovery if too many errors
+        if self._consecutive_errors >= self._max_consecutive_errors:
+            logger.error("[Watchdog] TX timeout threshold reached - initiating recovery")
+            await self._recover_radio()
 
     def _finalize_transmission(self) -> None:
         """Finalize transmission by checking status and logging results"""
