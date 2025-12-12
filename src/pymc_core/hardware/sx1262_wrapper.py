@@ -462,6 +462,16 @@ class SX1262Radio(LoRaRadio):
         if not self._initialized:
             return False
 
+        # Ensure event loop is captured for IRQ trampoline
+        # This is critical - without it, GPIO interrupts are ignored
+        if self._event_loop is None:
+            try:
+                self._event_loop = asyncio.get_running_loop()
+                logger.info("[RX] Event loop captured for IRQ handling")
+            except RuntimeError:
+                logger.warning("[RX] No event loop available for IRQ handling")
+                return False
+
         # Check if RX task is dead and restart it
         if (
             not hasattr(self, "_rx_irq_task")
